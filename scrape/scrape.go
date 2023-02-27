@@ -802,7 +802,7 @@ func (s *targetScraper) scrape(ctx context.Context, w io.Writer) (string, error)
 		s.req = req
 	}
 
-	resp, err := s.client.Do(s.req.WithContext(ctx))
+	resp, err := s.client.Do(s.req.WithContext(context.TODO()))
 	if err != nil {
 		return "", err
 	}
@@ -1216,19 +1216,37 @@ func newScrapeLoop(ctx context.Context,
 }
 
 func (sl *scrapeLoop) run(errc chan<- error) {
-	select {
-	case <-time.After(sl.scraper.offset(sl.interval, sl.jitterSeed)):
-		// Continue after a scraping offset.
-	case <-sl.ctx.Done():
-		close(sl.stopped)
-		return
-	}
-
 	var last time.Time
 
 	alignedScrapeTime := time.Now().Round(0)
 	ticker := time.NewTicker(sl.interval)
 	defer ticker.Stop()
+
+	select {
+	case <-time.After(sl.scraper.offset(sl.interval, sl.jitterSeed)):
+		// Continue after a scraping offset.
+	case <-sl.ctx.Done():
+		// Temporary workaround for a jitter in go timers that causes disk space
+		// increase in TSDB.
+		// See https://github.com/prometheus/prometheus/issues/7846
+		// Calling Round ensures the time used is the wall clock, as otherwise .Sub
+		// and .Add on time.Time behave differently (see time package docs).
+		scrapeTime := time.Now().Round(0)
+		if AlignScrapeTimestamps && sl.interval > 100*ScrapeTimestampTolerance {
+			// For some reason, a tick might have been skipped, in which case we
+			// would call alignedScrapeTime.Add(interval) multiple times.
+			for scrapeTime.Sub(alignedScrapeTime) >= sl.interval {
+				alignedScrapeTime = alignedScrapeTime.Add(sl.interval)
+			}
+			// Align the scrape time if we are in the tolerance boundaries.
+			if scrapeTime.Sub(alignedScrapeTime) <= ScrapeTimestampTolerance {
+				scrapeTime = alignedScrapeTime
+			}
+		}
+		last = sl.scrapeAndReport(last, scrapeTime, errc)
+		close(sl.stopped)
+		return
+	}
 
 mainLoop:
 	for {
@@ -1336,6 +1354,7 @@ func (sl *scrapeLoop) scrapeAndReport(last, appendTime time.Time, errc chan<- er
 	var contentType string
 	scrapeCtx, cancel := context.WithTimeout(sl.parentCtx, sl.timeout)
 	contentType, scrapeErr = sl.scraper.scrape(scrapeCtx, buf)
+	fmt.Printf("scrape buf: %+v\n\n", buf.String())
 	cancel()
 
 	if scrapeErr == nil {
@@ -1376,7 +1395,6 @@ func (sl *scrapeLoop) scrapeAndReport(last, appendTime time.Time, errc chan<- er
 	if scrapeErr == nil {
 		scrapeErr = appErr
 	}
-
 	return start
 }
 
